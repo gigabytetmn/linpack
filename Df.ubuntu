@@ -1,0 +1,13 @@
+FROM ubuntu:24.04 AS build
+
+WORKDIR /opt
+
+COPY . /opt
+
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential && make
+
+FROM ubuntu:24.04 AS runtime
+
+COPY --from=build /opt/linpack /opt
+
+CMD ["/opt/linpack"]

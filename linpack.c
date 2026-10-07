@@ -22,11 +22,19 @@
 **
 */
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
 #include <time.h>
 #include <float.h>
+#include <errno.h>
+#include <limits.h>
+#include <pthread.h>
+#include <sched.h>
+#include <stdint.h>
+#include <string.h>
+#include <unistd.h>
 
 #define DP
 
@@ -48,7 +56,17 @@ typedef float   REAL;
 typedef double  REAL;
 #endif
 
-static REAL linpack  (long nreps,int arsize);
+typedef struct {
+    int arsize;
+    long nreps;
+    void *mempool;
+    REAL tdgesl;
+    REAL tdgefa;
+} worker_data;
+
+static REAL linpack  (long nreps,int nthreads,worker_data *workers,int *status);
+static void *linpack_worker(void *arg);
+static int available_cpus(void);
 static void matgen   (REAL *a,int lda,int n,REAL *b,REAL *norma);
 static void dgefa    (REAL *a,int lda,int n,int *ipvt,int *info,int roll);
 static void dgesl    (REAL *a,int lda,int n,int *ipvt,REAL *b,int job,int roll);
@@ -61,108 +79,258 @@ static void dscal_ur (int n,REAL da,REAL *dx,int incx);
 static int  idamax   (int n,REAL *dx,int incx);
 static REAL second   (void);
 
-static void *mempool;
-
-
 int main(void)
 {
     char    *arsize_input;
-    int     arsize;
+    char    *threads_input;
+    char    *end;
+    int     arsize,nthreads,i,status;
+    long    parsed_value;
     long    arsize2d,nreps;
-    size_t  malloc_arg,memreq;
+    size_t  memreq,totalmem;
+    REAL    elapsed;
+    worker_data *workers;
 
     arsize_input = getenv("LINPACK_ARRAY_SIZE");
     if (arsize_input == NULL) {
         arsize = 200;
     } else {
-        arsize = atoi(arsize_input);
+        errno = 0;
+        parsed_value = strtol(arsize_input,&end,10);
+        if (errno != 0 || end == arsize_input || *end != '\0' ||
+                parsed_value < 10 || parsed_value > INT_MAX - 1) {
+            fprintf(stderr,"Invalid LINPACK_ARRAY_SIZE value.\n");
+            return 1;
+        }
+        arsize = (int)parsed_value;
     }
 
-        arsize/=2;
-        arsize*=2;
-        if (arsize<10)
-            {
-            printf("Too small.\n");
+    arsize/=2;
+    arsize*=2;
+    if (arsize<10) {
+        printf("Too small.\n");
+        return 1;
+    }
+
+    nthreads = available_cpus();
+    threads_input = getenv("LINPACK_THREADS");
+    if (threads_input != NULL) {
+        errno = 0;
+        parsed_value = strtol(threads_input,&end,10);
+        if (errno != 0 || end == threads_input || *end != '\0' ||
+                parsed_value < 1 || parsed_value > INT_MAX) {
+            fprintf(stderr,"Invalid LINPACK_THREADS value.\n");
             return 1;
-            }
-        arsize2d = (long)arsize*(long)arsize;
-        memreq=arsize2d*sizeof(REAL)+(long)arsize*sizeof(REAL)+(long)arsize*sizeof(int);
-        printf("Memory required:  %ldK.\n",(memreq+512L)>>10);
-        malloc_arg=(size_t)memreq;
-        if (malloc_arg!=memreq || (mempool=malloc(malloc_arg))==NULL)
-            {
-            printf("Not enough memory available for given array size.\n\n");
+        }
+        nthreads = (int)parsed_value;
+    }
+
+    if ((size_t)arsize > SIZE_MAX/(size_t)arsize/sizeof(REAL)) {
+        fprintf(stderr,"Requested array size is too large.\n");
+        return 2;
+    }
+    arsize2d = (long)arsize*(long)arsize;
+    memreq=(size_t)arsize2d*sizeof(REAL);
+    if (memreq > SIZE_MAX-(size_t)arsize*sizeof(REAL)-
+            (size_t)arsize*sizeof(int)) {
+        fprintf(stderr,"Requested array size is too large.\n");
+        return 2;
+    }
+    memreq+=(size_t)arsize*sizeof(REAL)+(size_t)arsize*sizeof(int);
+    if (memreq > SIZE_MAX / (size_t)nthreads) {
+        fprintf(stderr,"Requested thread count requires too much memory.\n");
+        return 2;
+    }
+    totalmem=memreq*(size_t)nthreads;
+    printf("Memory required:  %zuK (%zuK per thread).\n",
+            (totalmem>>10)+((totalmem&1023U)>=512U),
+            (memreq>>10)+((memreq&1023U)>=512U));
+    workers=calloc((size_t)nthreads,sizeof(*workers));
+    if (workers==NULL) {
+        fprintf(stderr,"Not enough memory available for worker data.\n\n");
+        return 2;
+    }
+    for (i=0;i<nthreads;i++) {
+        workers[i].arsize=arsize;
+        workers[i].mempool=malloc(memreq);
+        if (workers[i].mempool==NULL) {
+            fprintf(stderr,"Not enough memory available for worker %d.\n\n",i);
+            while (i > 0)
+                free(workers[--i].mempool);
+            free(workers);
             return 2;
-            }
-        printf("\n\nLINPACK benchmark, %s precision.\n",PREC);
-        printf("Machine precision:  %d digits.\n",BASE10DIG);
-        printf("Array size %d X %d.\n",arsize,arsize);
-        printf("Average rolled and unrolled performance:\n\n");
-        printf("    Reps Time(s) DGEFA   DGESL  OVERHEAD    KFLOPS\n");
-        printf("----------------------------------------------------\n");
-        nreps=1;
-        while (linpack(nreps,arsize)<10.)
-            nreps*=2;
-        free(mempool);
-        printf("\n");
+        }
+    }
+
+    printf("\n\nLINPACK benchmark, %s precision.\n",PREC);
+    printf("Machine precision:  %d digits.\n",BASE10DIG);
+    printf("Array size %d X %d.\n",arsize,arsize);
+    printf("Threads: %d (independent calculations).\n",nthreads);
+    printf("Aggregate rolled and unrolled performance:\n\n");
+    printf("    Reps Threads Time(s) DGEFA   DGESL  OVERHEAD    KFLOPS\n");
+    printf("------------------------------------------------------------\n");
+    nreps=1;
+    do {
+        status=0;
+        elapsed=linpack(nreps,nthreads,workers,&status);
+        if (elapsed<0.) {
+            for (i=0;i<nthreads;i++)
+                free(workers[i].mempool);
+            free(workers);
+            return status;
+        }
+        if (elapsed >= 10.)
+            break;
+        if (nreps > LONG_MAX / 2) {
+            fprintf(stderr,"Unable to reach benchmark duration safely.\n");
+            for (i=0;i<nthreads;i++)
+                free(workers[i].mempool);
+            free(workers);
+            return 2;
+        }
+        nreps*=2;
+    } while (1);
+
+    for (i=0;i<nthreads;i++)
+        free(workers[i].mempool);
+    free(workers);
+    printf("\n");
+    return 0;
 }
 
 
-static REAL linpack(long nreps,int arsize)
+static REAL linpack(long nreps,int nthreads,worker_data *workers,int *status)
+{
+    REAL tdgesl,tdgefa,totalt,toverhead,ops,kflops;
+    pthread_t *threads;
+    int i,created,error;
+    long n;
+    struct timespec start,finish;
 
-    {
-    REAL  *a,*b;
-    REAL   norma,t1,kflops,tdgesl,tdgefa,totalt,toverhead,ops;
-    int   *ipvt,n,info,lda;
-    long   i,arsize2d;
-
-    lda = arsize;
-    n = arsize/2;
-    arsize2d = (long)arsize*(long)arsize;
-    ops=((2.0*n*n*n)/3.0+2.0*n*n);
-    a=(REAL *)mempool;
-    b=a+arsize2d;
-    ipvt=(int *)&b[arsize];
-    tdgesl=0;
-    tdgefa=0;
-    totalt=second();
-    for (i=0;i<nreps;i++)
-        {
-        matgen(a,lda,n,b,&norma);
-        t1 = second();
-        dgefa(a,lda,n,ipvt,&info,1);
-        tdgefa += second()-t1;
-        t1 = second();
-        dgesl(a,lda,n,ipvt,b,0,1);
-        tdgesl += second()-t1;
+    if ((size_t)nthreads > SIZE_MAX/sizeof(*threads)) {
+        fprintf(stderr,"Requested thread count is too large.\n");
+        *status=2;
+        return -1.;
+    }
+    threads=malloc((size_t)nthreads*sizeof(*threads));
+    if (threads==NULL) {
+        fprintf(stderr,"Unable to allocate thread handles.\n");
+        *status=2;
+        return -1.;
+    }
+    if (clock_gettime(CLOCK_MONOTONIC,&start)!=0) {
+        fprintf(stderr,"Unable to read monotonic clock: %s\n",strerror(errno));
+        free(threads);
+        *status=2;
+        return -1.;
+    }
+    for (i=0;i<nthreads;i++) {
+        workers[i].nreps=nreps;
+        error=pthread_create(&threads[i],NULL,linpack_worker,&workers[i]);
+        if (error!=0) {
+            fprintf(stderr,"Unable to create worker thread %d: %s\n",
+                    i,strerror(error));
+            *status=2;
+            break;
         }
-    for (i=0;i<nreps;i++)
-        {
-        matgen(a,lda,n,b,&norma);
-        t1 = second();
-        dgefa(a,lda,n,ipvt,&info,0);
-        tdgefa += second()-t1;
-        t1 = second();
-        dgesl(a,lda,n,ipvt,b,0,0);
-        tdgesl += second()-t1;
+    }
+    created=i;
+    for (i=0;i<created;i++) {
+        error=pthread_join(threads[i],NULL);
+        if (error!=0) {
+            fprintf(stderr,"Unable to join worker thread %d: %s\n",
+                    i,strerror(error));
+            *status=2;
         }
-    totalt=second()-totalt;
-    if (totalt<0.5 || tdgefa+tdgesl<0.2)
-        return(0.);
-    kflops=2.*nreps*ops/(1000.*(tdgefa+tdgesl));
-    toverhead=totalt-tdgefa-tdgesl;
-    if (tdgefa<0.)
-        tdgefa=0.;
-    if (tdgesl<0.)
-        tdgesl=0.;
+    }
+    if (*status!=0) {
+        free(threads);
+        return -1.;
+    }
+    if (clock_gettime(CLOCK_MONOTONIC,&finish)!=0) {
+        fprintf(stderr,"Unable to read monotonic clock: %s\n",strerror(errno));
+        free(threads);
+        *status=2;
+        return -1.;
+    }
+    totalt=(REAL)(finish.tv_sec-start.tv_sec)+
+            (REAL)(finish.tv_nsec-start.tv_nsec)/1.0e9;
+    tdgesl=0.;
+    tdgefa=0.;
+    for (i=0;i<nthreads;i++) {
+        tdgesl+=workers[i].tdgesl;
+        tdgefa+=workers[i].tdgefa;
+    }
+    tdgesl/=nthreads;
+    tdgefa/=nthreads;
+    toverhead=totalt-tdgesl-tdgefa;
     if (toverhead<0.)
         toverhead=0.;
-    printf("%8ld %6.2f %6.2f%% %6.2f%% %6.2f%%  %9.3f\n",
-            nreps,totalt,100.*tdgefa/totalt,
-            100.*tdgesl/totalt,100.*toverhead/totalt,
-            kflops);
-    return(totalt);
+    n=workers[0].arsize/2;
+    ops=((2.0*n*n*n)/3.0+2.0*n*n);
+    kflops=(REAL)nthreads*2.*nreps*ops/(1000.*totalt);
+    if (totalt>=0.5 && tdgefa+tdgesl>=0.2) {
+        printf("%8ld %7d %6.2f %6.2f%% %6.2f%% %6.2f%%  %9.3f\n",
+                nreps,nthreads,totalt,100.*tdgefa/totalt,
+                100.*tdgesl/totalt,100.*toverhead/totalt,kflops);
     }
+    free(threads);
+    return(totalt);
+}
+
+static void *linpack_worker(void *arg)
+{
+    worker_data *worker=(worker_data *)arg;
+    REAL *a,*b,norma,t1;
+    int *ipvt,n,info,lda;
+    long i,arsize2d;
+
+    lda=worker->arsize;
+    n=worker->arsize/2;
+    arsize2d=(long)worker->arsize*(long)worker->arsize;
+    a=(REAL *)worker->mempool;
+    b=a+arsize2d;
+    ipvt=(int *)&b[worker->arsize];
+    worker->tdgesl=0.;
+    worker->tdgefa=0.;
+    for (i=0;i<worker->nreps;i++) {
+        matgen(a,lda,n,b,&norma);
+        t1=second();
+        dgefa(a,lda,n,ipvt,&info,1);
+        worker->tdgefa+=second()-t1;
+        t1=second();
+        dgesl(a,lda,n,ipvt,b,0,1);
+        worker->tdgesl+=second()-t1;
+    }
+    for (i=0;i<worker->nreps;i++) {
+        matgen(a,lda,n,b,&norma);
+        t1=second();
+        dgefa(a,lda,n,ipvt,&info,0);
+        worker->tdgefa+=second()-t1;
+        t1=second();
+        dgesl(a,lda,n,ipvt,b,0,0);
+        worker->tdgesl+=second()-t1;
+    }
+    return NULL;
+}
+
+static int available_cpus(void)
+{
+    long count;
+
+#ifdef __linux__
+    cpu_set_t cpus;
+    if (sched_getaffinity(0,sizeof(cpus),&cpus)==0) {
+        count=CPU_COUNT(&cpus);
+        if (count>0 && count<=INT_MAX)
+            return (int)count;
+    }
+#endif
+    count=sysconf(_SC_NPROCESSORS_ONLN);
+    if (count<1 || count>INT_MAX)
+        return 1;
+    return (int)count;
+}
 
 
 /*
@@ -869,9 +1037,11 @@ static int idamax(int n,REAL *dx,int incx)
 
 
 static REAL second(void)
-
-    {
-    return ((REAL)((REAL)clock()/(REAL)CLOCKS_PER_SEC));
+{
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC,&now)!=0) {
+        fprintf(stderr,"Unable to read monotonic clock: %s\n",strerror(errno));
+        exit(EXIT_FAILURE);
     }
-
-
+    return (REAL)now.tv_sec+(REAL)now.tv_nsec/1.0e9;
+}

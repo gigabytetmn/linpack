@@ -1,0 +1,18 @@
+FROM alpine:3.24 AS build
+
+WORKDIR /opt
+
+COPY . /opt
+
+RUN apk update && apk add build-base && \
+gcc linpack.c -o linpack -Wall -Wextra -O3 -std=c11 -pedantic
+
+FROM alpine:3.24 AS runtime
+
+WORKDIR /opt
+
+COPY --from=build /opt/linpack /opt
+
+USER 1000
+
+CMD ["/opt/linpack"]

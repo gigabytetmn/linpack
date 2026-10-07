@@ -8,30 +8,20 @@ To run the benchmark:
 
 The benchmark results will be printed on the console.
 
-Here are some sample results from my system with the default array size of 200:
+By default the benchmark starts one worker per CPU available to the process
+(using its CPU affinity where supported). Each worker runs an independent
+calculation with its own matrix and workspace. `KFLOPS` is aggregate throughput
+across all workers; `Reps` is the number of repetitions performed by each
+worker. The reported memory requirement is the total for all worker workspaces.
 
-```
-$ sudo docker run -it --rm elreyes/linpack
-Memory required:  315K.
+It is possible to customize the array size used by the benchmark code (size
+is 200 by default) and the number of workers. For example, to use four workers:
 
+`sudo docker run -it --rm -e LINPACK_ARRAY_SIZE=600 -e LINPACK_THREADS=4 elreyes/linpack`
 
-LINPACK benchmark, Double precision.
-Machine precision:  15 digits.
-Array size 200 X 200.
-Average rolled and unrolled performance:
-
-    Reps Time(s) DGEFA   DGESL  OVERHEAD    KFLOPS
-----------------------------------------------------
-    2048   0.71  78.02%   2.89%  19.09%  4917805.960
-    4096   1.43  78.02%   2.88%  19.11%  4870465.484
-    8192   2.86  78.00%   2.87%  19.13%  4863107.385
-   16384   5.70  77.98%   2.87%  19.14%  4882638.725
-   32768  11.41  77.98%   2.87%  19.14%  4878150.976
-```
-
-It is possible to customize the array size used by the benchmark code (size is 200 by default). To do this, set an environment variable when running the container:
-
-`sudo docker run -it --rm -e LINPACK_ARRAY_SIZE=600 elreyes/linpack`
+`LINPACK_THREADS` defaults to the number of available CPUs. Setting it lets you
+limit or explicitly choose the worker count. Each extra worker requires an
+additional private workspace, so memory use grows linearly with this value.
 
 ### Building the Image Locally
 

@@ -2,7 +2,7 @@ PROGRAMS = linpack
 
 CC = cc
 CFLAGS=-Wall -Wextra -O3 -std=c11 -pedantic -march=native
-LIBS=
+LIBS=-pthread -lm
 
 all: $(PROGRAMS)
 
